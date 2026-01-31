@@ -26,7 +26,13 @@ interface FlightData {
   terminal?: string;
   latitude?: number;
   longitude?: number;
+  originLatitude?: number;
+  originLongitude?: number;
+  destinationLatitude?: number;
+  destinationLongitude?: number;
   divertedTo?: string;
+  originTimezone?: string;
+  destinationTimezone?: string;
 }
 
 interface Airport {
@@ -54,6 +60,7 @@ interface WeatherData {
   temp: number;
   conditions: string;
   forecast?: string;
+  timezone?: string;
 }
 
 export default function App() {
@@ -65,9 +72,14 @@ export default function App() {
   const [weather, setWeather] = useState<WeatherData | null>(null);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [showDatePicker, setShowDatePicker] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   
   const planePosition = useRef(new Animated.Value(0)).current;
   const planeRotate = useRef(new Animated.Value(0)).current;
+
+  const aviationstackKey =
+    process.env.EXPO_PUBLIC_AVIATIONSTACK_KEY || process.env.AVIATIONSTACK_KEY || '';
 
   useEffect(() => {
     if (currentFlight && (currentFlight.status === 'airborne' || currentFlight.status === 'approach')) {
@@ -118,56 +130,12 @@ export default function App() {
 
   const handleTrackFlight = () => {
     if (!flightNumber.trim()) return;
-    
-    const now = Date.now();
-    const depTime = now + 5400000;
-    const arrTime = now + 12600000;
-    
-    const mockOptions: FlightData[] = [
-      {
-        flightKey: `${flightNumber}-${Date.now()}`,
-        airline: 'BA',
-        flightNumber: flightNumber,
-        origin: 'LHR',
-        destination: 'GVA',
-        scheduledDeparture: new Date(depTime).toISOString(),
-        scheduledArrival: new Date(arrTime).toISOString(),
-        estimatedDeparture: new Date(depTime + 300000).toISOString(),
-        estimatedArrival: new Date(arrTime - 600000).toISOString(),
-        status: 'scheduled',
-        gate: 'A12',
-        terminal: '5',
-      },
-      {
-        flightKey: `${flightNumber}-${Date.now() + 1}`,
-        airline: 'EZY',
-        flightNumber: flightNumber,
-        origin: 'LHR',
-        destination: 'GVA',
-        scheduledDeparture: new Date(now + 10800000).toISOString(),
-        scheduledArrival: new Date(now + 18000000).toISOString(),
-        estimatedDeparture: new Date(now + 10800000).toISOString(),
-        estimatedArrival: new Date(now + 18000000).toISOString(),
-        status: 'scheduled',
-        gate: 'B7',
-        terminal: '3',
-      },
-    ];
-
-    if (mockOptions.length > 1) {
-      setFlightOptions(mockOptions);
-      setScreen('ambiguity');
-    } else {
-      setCurrentFlight(mockOptions[0]);
-      fetchWeather(mockOptions[0].destination);
-      setLastUpdated(new Date());
-      setScreen('tracking');
-    }
+    fetchFlightOptions(flightNumber.trim());
   };
 
   const handleSelectFlight = (flight: FlightData) => {
     setCurrentFlight(flight);
-    fetchWeather(flight.destination);
+    fetchWeatherForDestination(flight);
     setLastUpdated(new Date());
     setScreen('tracking');
     setShowDatePicker(false);
@@ -175,86 +143,215 @@ export default function App() {
 
   const fetchFlightUpdate = () => {
     if (!currentFlight) return;
-
-    const statuses: FlightData['status'][] = ['scheduled', 'boarding', 'airborne', 'approach', 'landed'];
-    const currentIndex = statuses.indexOf(currentFlight.status);
-    const nextStatus = currentIndex < statuses.length - 1 ? statuses[currentIndex + 1] : currentFlight.status;
-
-    const origin = AIRPORTS[currentFlight.origin];
-    const dest = AIRPORTS[currentFlight.destination];
-    
-    let lat = currentFlight.latitude;
-    let lon = currentFlight.longitude;
-    
-    if (nextStatus === 'airborne' && origin && dest) {
-      lat = origin.lat + (dest.lat - origin.lat) * 0.3;
-      lon = origin.lon + (dest.lon - origin.lon) * 0.3;
-    } else if (nextStatus === 'approach' && origin && dest) {
-      lat = origin.lat + (dest.lat - origin.lat) * 0.7;
-      lon = origin.lon + (dest.lon - origin.lon) * 0.7;
-    }
-
-    const updated: FlightData = {
-      ...currentFlight,
-      status: nextStatus,
-      latitude: lat,
-      longitude: lon,
-    };
-
-    setCurrentFlight(updated);
-    setLastUpdated(new Date());
+    fetchLiveFlight(currentFlight.flightNumber, false);
   };
 
-  const fetchWeather = (airportCode: string) => {
-    const airport = AIRPORTS[airportCode];
-    if (!airport) {
+  const fetchFlightOptions = async (flightNumberInput: string) => {
+    setLoading(true);
+    setErrorMessage(null);
+    try {
+      const options = await fetchLiveFlights(flightNumberInput);
+      if (options.length > 1) {
+        setFlightOptions(options);
+        setScreen('ambiguity');
+      } else if (options.length === 1) {
+        setCurrentFlight(options[0]);
+        fetchWeatherForDestination(options[0]);
+        setLastUpdated(new Date());
+        setScreen('tracking');
+      } else {
+        setErrorMessage('No matching flights found.');
+      }
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Unable to fetch live flight data.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchLiveFlight = async (flightNumberInput: string, updateScreen = true) => {
+    setLoading(true);
+    setErrorMessage(null);
+    try {
+      const options = await fetchLiveFlights(flightNumberInput);
+      if (options.length === 0) {
+        setErrorMessage('No matching flights found.');
+        return;
+      }
+      const match = selectBestFlightMatch(options, currentFlight);
+      setCurrentFlight(match);
+      fetchWeatherForDestination(match);
+      setLastUpdated(new Date());
+      if (updateScreen) {
+        setScreen('tracking');
+      }
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Unable to fetch live flight data.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchLiveFlights = async (flightNumberInput: string): Promise<FlightData[]> => {
+    if (!aviationstackKey) {
+      throw new Error('Missing aviationstack API key. Set EXPO_PUBLIC_AVIATIONSTACK_KEY.');
+    }
+
+    const response = await fetch(
+      `https://api.aviationstack.com/v1/flights?access_key=${aviationstackKey}&flight_iata=${encodeURIComponent(
+        flightNumberInput
+      )}`
+    );
+
+    if (!response.ok) {
+      throw new Error('Failed to reach aviationstack API.');
+    }
+
+    const payload = await response.json();
+    if (!payload?.data || payload.data.length === 0) {
+      return [];
+    }
+
+    return payload.data
+      .map((item: any) => mapAviationstackFlight(item))
+      .filter((flight: FlightData | null) => Boolean(flight)) as FlightData[];
+  };
+
+  const mapAviationstackFlight = (item: any): FlightData | null => {
+    if (!item?.flight?.iata) {
+      return null;
+    }
+
+    const status = mapFlightStatus(item.flight_status, item.live);
+    const departure = item.departure || {};
+    const arrival = item.arrival || {};
+    const live = item.live || {};
+
+    const origin = departure.iata || departure.icao || '';
+    const destination = arrival.iata || arrival.icao || '';
+
+    return {
+      flightKey: `${item.flight.iata}-${item.flight.date || item.flight_number || Date.now()}`,
+      airline: item.airline?.iata || item.airline?.name || 'Unknown',
+      flightNumber: item.flight.iata,
+      origin,
+      destination,
+      scheduledDeparture: departure.scheduled || departure.estimated || new Date().toISOString(),
+      scheduledArrival: arrival.scheduled || arrival.estimated || new Date().toISOString(),
+      estimatedDeparture: departure.estimated || undefined,
+      estimatedArrival: arrival.estimated || undefined,
+      status,
+      gate: pickGate(status, departure, arrival),
+      terminal: pickTerminal(status, departure, arrival),
+      latitude: live.latitude ?? undefined,
+      longitude: live.longitude ?? undefined,
+      originLatitude: departure.latitude ?? AIRPORTS[origin]?.lat,
+      originLongitude: departure.longitude ?? AIRPORTS[origin]?.lon,
+      destinationLatitude: arrival.latitude ?? AIRPORTS[destination]?.lat,
+      destinationLongitude: arrival.longitude ?? AIRPORTS[destination]?.lon,
+      divertedTo: arrival.iata ?? undefined,
+      originTimezone: departure.timezone ?? AIRPORTS[origin]?.timezone,
+      destinationTimezone: arrival.timezone ?? undefined,
+    };
+  };
+
+  const mapFlightStatus = (status: string, live: any): FlightData['status'] => {
+    if (!status) return 'scheduled';
+    if (status === 'cancelled') return 'cancelled';
+    if (status === 'diverted') return 'diverted';
+    if (status === 'landed') return 'landed';
+    if (status === 'active') {
+      if (live?.is_ground) {
+        return 'boarding';
+      }
+      return live?.direction ? 'airborne' : 'airborne';
+    }
+    return 'scheduled';
+  };
+
+  const pickGate = (status: FlightData['status'], departure: any, arrival: any) => {
+    if (status === 'landed' || status === 'approach') {
+      return arrival?.gate || arrival?.baggage;
+    }
+    return departure?.gate;
+  };
+
+  const pickTerminal = (status: FlightData['status'], departure: any, arrival: any) => {
+    if (status === 'landed' || status === 'approach') {
+      return arrival?.terminal;
+    }
+    return departure?.terminal;
+  };
+
+  const selectBestFlightMatch = (options: FlightData[], current: FlightData | null) => {
+    if (!current) {
+      return options[0];
+    }
+    return (
+      options.find(
+        (option) =>
+          option.flightNumber === current.flightNumber &&
+          option.origin === current.origin &&
+          option.destination === current.destination
+      ) || options[0]
+    );
+  };
+
+  const fetchWeatherForDestination = async (flight: FlightData) => {
+    const coords = getDestinationCoordinates(flight);
+    if (!coords) {
       setWeather(null);
       return;
     }
 
-    const temps: Record<string, number> = {
-      LAX: 22,
-      JFK: 15,
-      ORD: 12,
-      DFW: 25,
-      SFO: 18,
-      LHR: 14,
-      CDG: 16,
-      NRT: 20,
-      GVA: 18,
-      AMS: 13,
-      FRA: 15,
-    };
+    try {
+      const response = await fetch(
+        `https://api.open-meteo.com/v1/forecast?latitude=${coords.lat}&longitude=${coords.lon}&current=temperature_2m,weather_code&timezone=auto`
+      );
+      if (!response.ok) {
+        setWeather(null);
+        return;
+      }
+      const payload = await response.json();
+      const temp = payload?.current?.temperature_2m;
+      const conditions = mapWeatherCode(payload?.current?.weather_code);
+      setWeather({
+        temp: typeof temp === 'number' ? Math.round(temp) : 0,
+        conditions,
+        forecast: payload?.current?.weather_code?.toString(),
+        timezone: payload?.timezone,
+      });
+    } catch (error) {
+      setWeather(null);
+    }
+  };
 
-    const conditions: Record<string, string> = {
-      LAX: 'Clear',
-      JFK: 'Cloudy',
-      ORD: 'Partly Cloudy',
-      DFW: 'Clear',
-      SFO: 'Foggy',
-      LHR: 'Rainy',
-      CDG: 'Cloudy',
-      NRT: 'Clear',
-      GVA: 'Clear',
-      AMS: 'Cloudy',
-      FRA: 'Partly Cloudy',
-    };
-
-    setWeather({
-      temp: temps[airportCode] || 18,
-      conditions: conditions[airportCode] || 'Clear',
-      forecast: 'Partly Cloudy',
-    });
+  const mapWeatherCode = (code?: number) => {
+    if (code === undefined || code === null) return 'Clear';
+    if (code === 0) return 'Clear';
+    if ([1, 2, 3].includes(code)) return 'Partly Cloudy';
+    if ([45, 48].includes(code)) return 'Foggy';
+    if ([51, 53, 55, 56, 57].includes(code)) return 'Drizzle';
+    if ([61, 63, 65, 66, 67, 80, 81, 82].includes(code)) return 'Rainy';
+    if ([71, 73, 75, 77, 85, 86].includes(code)) return 'Snowy';
+    if ([95, 96, 99].includes(code)) return 'Stormy';
+    return 'Cloudy';
   };
 
   const calculateProgress = (): number => {
     if (!currentFlight) return 0;
 
-    const origin = AIRPORTS[currentFlight.origin];
-    const dest = AIRPORTS[currentFlight.destination];
+    const { origin, destination } = getRouteCoordinates(currentFlight);
     
-    if (currentFlight.latitude && currentFlight.longitude && origin && dest) {
-      const totalDist = calculateDistance(origin.lat, origin.lon, dest.lat, dest.lon);
+    if (currentFlight.status === 'landed') return 1;
+
+    if (
+      currentFlight.latitude !== undefined &&
+      currentFlight.longitude !== undefined &&
+      origin &&
+      destination
+    ) {
+      const totalDist = calculateDistance(origin.lat, origin.lon, destination.lat, destination.lon);
       const currentDist = calculateDistance(origin.lat, origin.lon, currentFlight.latitude, currentFlight.longitude);
       return Math.min(currentDist / totalDist, 1);
     }
@@ -284,6 +381,46 @@ export default function App() {
     return Math.floor(calculateProgress() * 100);
   };
 
+  const getRouteCoordinates = (flight: FlightData) => {
+    const origin =
+      flight.originLatitude && flight.originLongitude
+        ? { lat: flight.originLatitude, lon: flight.originLongitude }
+        : AIRPORTS[flight.origin];
+    const destination =
+      flight.destinationLatitude && flight.destinationLongitude
+        ? { lat: flight.destinationLatitude, lon: flight.destinationLongitude }
+        : AIRPORTS[flight.destination];
+    return { origin, destination };
+  };
+
+  const getDestinationCoordinates = (flight: FlightData) => {
+    if (flight.destinationLatitude && flight.destinationLongitude) {
+      return { lat: flight.destinationLatitude, lon: flight.destinationLongitude };
+    }
+    const fallback = AIRPORTS[flight.destination];
+    return fallback ? { lat: fallback.lat, lon: fallback.lon } : null;
+  };
+
+  const getDistanceMetrics = () => {
+    if (!currentFlight) return null;
+    const { origin, destination } = getRouteCoordinates(currentFlight);
+    if (!origin || !destination) {
+      return null;
+    }
+
+    const total = calculateDistance(origin.lat, origin.lon, destination.lat, destination.lon);
+    if (currentFlight.latitude !== undefined && currentFlight.longitude !== undefined) {
+      const traveled = calculateDistance(origin.lat, origin.lon, currentFlight.latitude, currentFlight.longitude);
+      const remaining = Math.max(total - traveled, 0);
+      return { total, traveled, remaining };
+    }
+
+    const progress = calculateProgress();
+    const traveled = total * progress;
+    const remaining = Math.max(total - traveled, 0);
+    return { total, traveled, remaining };
+  };
+
   const formatTime = (isoString: string, timezoneId?: string): string => {
     const date = new Date(isoString);
     return date.toLocaleTimeString('en-US', { 
@@ -307,6 +444,25 @@ export default function App() {
     return `${hours}h ${mins}m`;
   };
 
+  const getDestinationLocalTime = (): string => {
+    if (!currentFlight) return '';
+    const timezone = currentFlight.destinationTimezone || weather?.timezone;
+    try {
+      return new Date().toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+        timeZone: timezone,
+      });
+    } catch (error) {
+      return new Date().toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      });
+    }
+  };
+
   if (screen === 'input') {
     return (
       <View style={styles.container}>
@@ -322,13 +478,20 @@ export default function App() {
             placeholderTextColor={tokens.colors['secondary-dark']}
             autoCapitalize="characters"
           />
+          {errorMessage && (
+            <Text style={[styles.errorText, { color: tokens.colors.red }]}>{errorMessage}</Text>
+          )}
           <TouchableOpacity
-            style={styles.trackButton}
+            style={[styles.trackButton, loading && styles.buttonDisabled]}
             onPress={handleTrackFlight}
             activeOpacity={0.7}
+            disabled={loading}
           >
-            <Text style={styles.trackButtonText}>TRACK FLIGHT</Text>
+            <Text style={styles.trackButtonText}>{loading ? 'LOADING...' : 'TRACK FLIGHT'}</Text>
           </TouchableOpacity>
+          <Text style={styles.helperText}>
+            Live data requires an aviationstack API key (EXPO_PUBLIC_AVIATIONSTACK_KEY).
+          </Text>
         </View>
       </View>
     );
@@ -344,9 +507,13 @@ export default function App() {
           <Text style={[styles.label, { color: tokens.colors['secondary-light'], marginBottom: tokens.spacing[3] }]}>
             SELECT FLIGHT
           </Text>
+          {errorMessage && (
+            <Text style={[styles.errorText, { color: tokens.colors.red }]}>{errorMessage}</Text>
+          )}
           {flightOptions.map((flight, index) => {
-            const origin = AIRPORTS[flight.origin];
-            const dest = AIRPORTS[flight.destination];
+            const { origin, destination } = getRouteCoordinates(flight);
+            const originTimezone = flight.originTimezone || origin?.timezone;
+            const destinationTimezone = flight.destinationTimezone || destination?.timezone;
             
             return (
               <TouchableOpacity
@@ -368,10 +535,10 @@ export default function App() {
                 </View>
                 <View style={styles.optionTimes}>
                   <Text style={[styles.optionTime, { color: tokens.colors['secondary-light'] }]}>
-                    {formatTime(flight.scheduledDeparture, origin?.timezone)}
+                    {formatTime(flight.scheduledDeparture, originTimezone)}
                   </Text>
                   <Text style={[styles.optionTime, { color: tokens.colors['secondary-light'] }]}>
-                    {formatTime(flight.scheduledArrival, dest?.timezone)}
+                    {formatTime(flight.scheduledArrival, destinationTimezone)}
                   </Text>
                 </View>
                 {flight.gate && flight.terminal && (
@@ -389,8 +556,10 @@ export default function App() {
 
   if (screen === 'tracking' && currentFlight) {
     const progress = getProgressDots();
-    const origin = AIRPORTS[currentFlight.origin];
-    const dest = AIRPORTS[currentFlight.destination];
+    const { origin, destination } = getRouteCoordinates(currentFlight);
+    const originTimezone = currentFlight.originTimezone || origin?.timezone;
+    const destinationTimezone = currentFlight.destinationTimezone || destination?.timezone;
+    const distanceMetrics = getDistanceMetrics();
 
     return (
       <View style={styles.container}>
@@ -470,6 +639,14 @@ export default function App() {
               </View>
             </>
           )}
+          {distanceMetrics && (
+            <View style={styles.infoRow}>
+              <Text style={[styles.infoLabel, { color: tokens.colors['secondary-light'] }]}>DISTANCE</Text>
+              <Text style={styles.infoValue}>
+                {Math.round(distanceMetrics.traveled)} km / {Math.round(distanceMetrics.remaining)} km left
+              </Text>
+            </View>
+          )}
 
           <View style={styles.timesRow}>
             <View style={styles.timeBlock}>
@@ -477,13 +654,13 @@ export default function App() {
               <Text style={styles.timeValue}>
                 {formatTime(
                   currentFlight.estimatedDeparture || currentFlight.scheduledDeparture,
-                  origin?.timezone
+                  originTimezone
                 )}
               </Text>
               {currentFlight.estimatedDeparture && 
                currentFlight.estimatedDeparture !== currentFlight.scheduledDeparture && (
                 <Text style={[styles.scheduledTime, { color: tokens.colors['secondary-dark'] }]}>
-                  Sched: {formatTime(currentFlight.scheduledDeparture, origin?.timezone)}
+                  Sched: {formatTime(currentFlight.scheduledDeparture, originTimezone)}
                 </Text>
               )}
             </View>
@@ -492,13 +669,13 @@ export default function App() {
               <Text style={styles.timeValue}>
                 {formatTime(
                   currentFlight.estimatedArrival || currentFlight.scheduledArrival,
-                  dest?.timezone
+                  destinationTimezone
                 )}
               </Text>
               {currentFlight.estimatedArrival && 
                currentFlight.estimatedArrival !== currentFlight.scheduledArrival && (
                 <Text style={[styles.scheduledTime, { color: tokens.colors['secondary-dark'] }]}>
-                  Sched: {formatTime(currentFlight.scheduledArrival, dest?.timezone)}
+                  Sched: {formatTime(currentFlight.scheduledArrival, destinationTimezone)}
                 </Text>
               )}
             </View>
@@ -521,10 +698,15 @@ export default function App() {
             </View>
           )}
 
-          {weather && dest && (
+          <View style={styles.infoRow}>
+            <Text style={[styles.infoLabel, { color: tokens.colors['secondary-light'] }]}>DEST TIME</Text>
+            <Text style={styles.infoValue}>{getDestinationLocalTime()}</Text>
+          </View>
+
+          {weather && destination && (
             <View style={styles.weatherRow}>
               <Text style={[styles.infoLabel, { color: tokens.colors['secondary-light'] }]}>
-                {dest.iata} WEATHER
+                {destination.iata} WEATHER
               </Text>
               <Text style={styles.weatherValue}>{weather.temp}°C · {weather.conditions}</Text>
             </View>
@@ -535,6 +717,9 @@ export default function App() {
           <Text style={styles.timestamp}>
             Updated {lastUpdated.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })}
           </Text>
+        )}
+        {errorMessage && (
+          <Text style={[styles.errorText, { color: tokens.colors.red }]}>{errorMessage}</Text>
         )}
       </View>
     );
@@ -608,9 +793,21 @@ const styles = StyleSheet.create({
     borderRadius: tokens.borderRadius.md,
     alignItems: 'center',
   },
+  buttonDisabled: {
+    opacity: 0.6,
+  },
   trackButtonText: {
     ...tokens.textStyles.labelMedium,
     color: tokens.colors.dark,
+  },
+  helperText: {
+    ...tokens.textStyles.bodySmall,
+    color: tokens.colors['secondary-light'],
+    marginTop: tokens.spacing[2],
+  },
+  errorText: {
+    ...tokens.textStyles.bodySmall,
+    marginBottom: tokens.spacing[2],
   },
   scrollView: {
     flex: 1,
